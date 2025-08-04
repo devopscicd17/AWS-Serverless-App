@@ -1,4 +1,4 @@
-name: Build and Push Lambda Docker Image
+name: Build, Scan and Deploy Lambda Docker Image
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
       - main
     paths:
       - 'lambda/**'
-      - '.github/workflows/deploy-lambda.yml'
+      - '.github/workflows/lambda-build.yml'
 
 jobs:
   deploy:
@@ -27,13 +27,50 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build, tag, and push image to ECR
+    - name: Build Docker image
       env:
-        ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: latest
       run: |
         cd lambda
         docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+
+    - name: Download twistcli from Prisma Cloud Console
+      run: |
+        curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+        --output twistcli \
+        "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
+        chmod +x twistcli
+
+    - name: Scan image with Prisma Cloud
+      env:
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        IMAGE_TAG: latest
+      run: |
+        ./twistcli images scan \
+        --address ${{ secrets.PRISMA_CONSOLE_URL }} \
+        --user ${{ secrets.PRISMA_ACCESS_KEY }} \
+        --password ${{ secrets.PRISMA_SECRET_KEY }} \
+        --details \
+        $ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Tag and push Docker image to ECR
+      env:
+        ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        IMAGE_TAG: latest
+      run: |
         docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+    - name: Deploy container image to Lambda
+      env:
+        FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
+        ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+        IMAGE_TAG: latest
+      run: |
+        aws lambda update-function-code \
+          --function-name $FUNCTION_NAME \
+          --image-uri $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
