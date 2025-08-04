@@ -92,4 +92,3 @@ jobs:
               --image-uri $IMAGE_URI \
               --region $AWS_REGION
           fi
-
