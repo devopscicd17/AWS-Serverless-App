@@ -7,6 +7,99 @@ on:
     paths:
       - 'lambda/**'
       - '.github/workflows/lambda-build.yml'
+name: Build, Scan and Deploy Lambda Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'lambda/**'
+      - '.github/workflows/lambda-build.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build Docker image
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+        run: |
+          cd lambda
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+
+      - name: Download twistcli from Prisma Cloud Console
+        run: |
+          curl -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+            --output twistcli \
+            "${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli"
+          chmod +x twistcli
+
+      - name: Scan image with Prisma Cloud
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+        run: |
+          ./twistcli images scan \
+            --address ${{ secrets.PRISMA_CONSOLE_URL }} \
+            --user ${{ secrets.PRISMA_ACCESS_KEY }} \
+            --password ${{ secrets.PRISMA_SECRET_KEY }} \
+            --details \
+            $ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Tag and push image to ECR
+        env:
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+        run: |
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+      - name: Deploy container image to AWS Lambda (create or update)
+        env:
+          FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: latest
+          LAMBDA_EXECUTION_ROLE_ARN: ${{ secrets.LAMBDA_EXECUTION_ROLE_ARN }}
+        run: |
+          set -e
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "Checking if Lambda function '$FUNCTION_NAME' exists..."
+
+          if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" 2>&1 | grep -q 'ResourceNotFoundException'; then
+            echo "Function does not exist. Creating it using container image..."
+            aws lambda create-function \
+              --function-name "$FUNCTION_NAME" \
+              --package-type Image \
+              --code ImageUri="$IMAGE_URI" \
+              --role "$LAMBDA_EXECUTION_ROLE_ARN" \
+              --region "$AWS_REGION"
+          else
+            echo "Function exists. Updating image..."
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --image-uri "$IMAGE_URI" \
+              --region "$AWS_REGION"
+          fi
 
 jobs:
   deploy:
